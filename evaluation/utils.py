@@ -18,6 +18,13 @@ model_metric_dict = {
         "performance_threshold",
     ],
     "svm": ["embedding", "willingness_to_pay"],
+    "krusch_cascade": [
+        "neighbors",
+        "ridge_alpha",
+        "embedding",
+        "willingness_to_pay",
+    ],
+    "krusch_zero_shot": ["willingness_to_pay"],
 }
 
 

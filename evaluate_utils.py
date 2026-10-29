@@ -1,12 +1,13 @@
 import os
 from datetime import datetime
 
-import gcsfs
 import pandas as pd
 import tqdm
 
 from evaluation.eval import DefaultEvaluationResult, EvaluationResultCollection
 from routers.knn_router import KNNRouter
+from routers.krusch_cascade_router import (KruschCascadeRouter,
+                                           KruschZeroShotRouter)
 from routers.mlp_router import MLPRouter
 from routers.svm_router import SVMRouter
 from utils import save_data_to_file
@@ -118,7 +119,7 @@ def parse_params_from_model_name(model_name: str) -> dict:
     params = {}
     model_name = model_name.split("|")
     for param in [name for name in model_name if ":" in name]:
-        param = param.split(":")
+        param = param.split(":", 1)
         params[param[0]] = param[1]
     return params
 
@@ -163,7 +164,37 @@ def generate_svm_routers(
     return model_routers_and_names
 
 
+def generate_krusch_routers(
+    parameter_combinations, cache, train_df, fraction, models_to_route
+):
+    print("training krusch_cascade models")
+    model_routers_and_names = []
+    for embed_model, neighbor_count, ridge_alpha in tqdm.tqdm(parameter_combinations):
+        router = KruschCascadeRouter(
+            train_file=train_df,
+            n_neighbors=neighbor_count,
+            ridge_alpha=ridge_alpha,
+            embedding_model=embed_model,
+            cache=cache,
+            models_to_route=models_to_route,
+        )
+        router_name = (
+            f"krusch_cascade|neighbors:{neighbor_count}|ridge_alpha:{ridge_alpha}"
+            f"|embedding:{embed_model}|fraction:{fraction}"
+        )
+        model_routers_and_names.append((router, router_name))
+    return model_routers_and_names
+
+
+def generate_krusch_zero_shot_routers(fraction, models_to_route):
+    router = KruschZeroShotRouter(models_to_route=models_to_route)
+    router_name = f"krusch_zero_shot|fraction:{fraction}"
+    return [(router, router_name)]
+
+
 def update_df_to_gcs(df, gcs_dir, filename, bucket, token):
+    import gcsfs
+
     fs = gcsfs.GCSFileSystem(project=bucket, token=token)
     final_gcs_dir = os.path.join(gcs_dir, filename)
     full_gcs_path = f"gcs://{bucket}/" + final_gcs_dir
@@ -180,6 +211,8 @@ def update_df_to_gcs(df, gcs_dir, filename, bucket, token):
 
 
 def update_file_to_gcs(filepath, gcs_dir, filename, bucket, token):
+    import gcsfs
+
     fs = gcsfs.GCSFileSystem(project=bucket, token=token)
     final_gcs_dir = os.path.join(gcs_dir, filename)
     full_gcs_path = f"gcs://{bucket}/" + final_gcs_dir

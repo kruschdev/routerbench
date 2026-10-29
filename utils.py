@@ -63,7 +63,7 @@ def parse_model_parameters(model_string: str) -> dict:
     output_dict = {}
     output_dict["routing_algorithm"] = parts[0]
     output_dict["value_type"] = parts[-1]
-    model_parameters = [parameter.split(":") for parameter in parts[1:-1]]
+    model_parameters = [parameter.split(":", 1) for parameter in parts[1:-1]]
     model_parameters = {key: value for key, value in model_parameters}
     return {**output_dict, **model_parameters}
 

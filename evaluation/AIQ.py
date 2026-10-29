@@ -5,7 +5,8 @@ import pandas as pd
 
 def calculate_area_under_curve(points: np.ndarray):
     assert points.shape[1] == 2
-    return np.trapz(points[:, 1], points[:, 0])
+    trapz_fn = getattr(np, "trapezoid", np.trapz)
+    return trapz_fn(points[:, 1], points[:, 0])
 
 
 def get_non_descreasing_convex_hull_of(points: np.ndarray):
@@ -86,10 +87,15 @@ def calc_AIQ(
     1. for each of the router_result, find the convex hull
     2. find the largest co
     """
+    expected_eval_name = (
+        graph_title_eval_name
+        if graph_title_eval_name is not None
+        else router_results_list[0]["eval_name"].iloc[0]
+    )
     for router_result in router_results_list:
         assert (
             router_result["eval_name"].nunique() == 1
-            and router_result["eval_name"].iloc[0] == eval_name
+            and router_result["eval_name"].iloc[0] == expected_eval_name
         )
 
     # find the list of (non-decreasing) convex hulls for each of the router_result

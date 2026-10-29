@@ -6,33 +6,39 @@ from pathlib import Path
 from typing import Optional, Tuple, Union
 
 import dotenv
-import modal
 import numpy as np
 import pandas as pd
 import tqdm
 from jsonargparse import ActionConfigFile, ArgumentParser
 from tqdm.auto import tqdm as tqdm_auto
 
-from evaluate_utils import (combined_eval_results_to_eval_collection,
-                            generate_knn_routers, generate_mlp_routers,
-                            generate_svm_routers, parse_params_from_model_name,
-                            save_results, update_df_to_gcs, update_file_to_gcs)
+from embedding.cache import EmbeddingCache
+from evaluate_utils import (
+    combined_eval_results_to_eval_collection,
+    generate_knn_routers,
+    generate_krusch_routers,
+    generate_krusch_zero_shot_routers,
+    generate_mlp_routers,
+    generate_svm_routers,
+    parse_params_from_model_name,
+    save_results,
+    update_df_to_gcs,
+    update_file_to_gcs,
+)
+from routers.run_cascading_router import run_cascading_router_for_eval_dataframe
+from utils import WILLINGNESS_TO_PAY, build_train_eval_dataset, get_models_to_route
 
 tqdm_auto.pandas()
-
-from embedding.cache import EmbeddingCache
-from routers.run_cascading_router import \
-    run_cascading_router_for_eval_dataframe
-from utils import (WILLINGNESS_TO_PAY, build_train_eval_dataset,
-                   get_models_to_route)
 
 warnings.simplefilter("ignore")
 dotenv.load_dotenv()
 
-EMBEDDING_CONNECTION_STRING = os.environ["CONNECTION_STRING"]
+EMBEDDING_CONNECTION_STRING = os.environ.get("CONNECTION_STRING", "")
 
 
 def run_modal_results(model_params, dataset_df, willingness_to_pay):
+    import modal
+
     print(f"Evaluating {model_params[-1]} Willingness_to_pay: {willingness_to_pay}")
     model_router_name = model_params[-1]
     modal_factory = modal.Cls.lookup("router_benchmark_paper", "Model")
@@ -109,14 +115,16 @@ def get_results_for_all_evals(
     # Other option would be to save the model responses in a separate dataframe, and then join them back together
     # Or put the model_response in a |model_response column
 
+    models_in_df = get_models_to_route(dataset_df)
     required_columns = [
         "sample_id",
-    ] + MODELS_TO_ROUTE
+    ] + models_in_df
     for column in required_columns:
         assert (
             column in dataset_df.columns
         ), f"{column} column not found in input dataframe"
 
+    dataset_df = dataset_df.dropna(subset=models_in_df).copy()
     model_router_list = []
     if use_local:
         max_workers = 1
@@ -144,7 +152,7 @@ def get_results_for_all_evals(
         for pay_router_name in result.keys():
             dataset_df[pay_router_name] = result[pay_router_name]
             dataset_df[pay_router_name] = dataset_df[pay_router_name].apply(
-                lambda name: name if name in MODELS_TO_ROUTE else None
+                lambda name: name if name in models_in_df else None
             )
             dataset_df[pay_router_name + "|total_cost"] = dataset_df.apply(
                 lambda row: row[row[pay_router_name] + "|total_cost"],
@@ -167,18 +175,24 @@ def get_results_for_all_evals(
     for model_router in model_router_list + ["oracle"]:
         row_indices = np.arange(dataset_df.shape[0])
         col_indices = dataset_df.columns.get_indexer(dataset_df[model_router])
-        dataset_df[model_router] = dataset_df.to_numpy()[row_indices, col_indices]
+        valid_col = col_indices >= 0
+        looked_up = np.zeros(dataset_df.shape[0], dtype=float)
+        if np.any(valid_col):
+            looked_up[valid_col] = dataset_df.to_numpy()[
+                row_indices[valid_col], col_indices[valid_col]
+            ].astype(float)
+        dataset_df[model_router] = looked_up
     # transform into long format
     extra_model_names = ["oracle"] + model_router_list
     extra_model_cost_names = ["oracle|total_cost"] + [
         router_name + "|total_cost" for router_name in model_router_list
     ]
     dataset_df = dataset_df.drop_duplicates(subset=["sample_id"])
-    llm_total_cost_names = [name + "|total_cost" for name in MODELS_TO_ROUTE]
+    llm_total_cost_names = [name + "|total_cost" for name in models_in_df]
     eval_names = dataset_df[["sample_id", "eval_name"]]
     df2 = dataset_df.melt(
         id_vars=["sample_id"],
-        value_vars=MODELS_TO_ROUTE
+        value_vars=models_in_df
         + llm_total_cost_names
         + extra_model_names
         + extra_model_cost_names,
@@ -301,6 +315,16 @@ if __name__ == "__main__":
     )
     parser.add_argument("--mlp.activation", type=list[str])
     parser.add_argument("--mlp.learning_rates", type=list[float])
+    parser.add_argument(
+        "--krusch_cascade.neighbors",
+        type=list[int],
+        default=[32],
+    )
+    parser.add_argument(
+        "--krusch_cascade.ridge_alphas",
+        type=list[float],
+        default=[14.0],
+    )
     parser.add_argument("--cascading_router.error_rates", type=list[float])
     parser.add_argument(
         "--cascading_router.max_cost_per_response_list", type=list[float]
@@ -334,6 +358,8 @@ if __name__ == "__main__":
     hidden_layer_sizes = args.mlp.hidden_layer_sizes
     activations = args.mlp.activation
     learning_rates = args.mlp.learning_rates
+    krusch_neighbors = args.krusch_cascade.neighbors
+    krusch_ridge_alphas = args.krusch_cascade.ridge_alphas
 
     embedding_models = (
         args.embedding_models if args.embedding_models else ["all-MiniLM-L6-v2"]
@@ -403,7 +429,17 @@ if __name__ == "__main__":
         model_routers_and_names = []
         all_parameter_combinations = []
         dataset_df_train, dataset_df_eval = build_train_eval_dataset(
-            wanted_eval_name, other_eval_names, dataset_df, fraction=fraction
+            wanted_eval_name,
+            other_eval_names,
+            dataset_df,
+            fraction=fraction,
+            out_of_distribution=args.out_of_distribution,
+        )
+        dataset_df_train = dataset_df_train.dropna(subset=MODELS_TO_ROUTE).reset_index(
+            drop=True
+        )
+        dataset_df_eval = dataset_df_eval.dropna(subset=MODELS_TO_ROUTE).reset_index(
+            drop=True
         )
 
         if args.local:
@@ -421,6 +457,12 @@ if __name__ == "__main__":
                 for lr in learning_rates
             ]
             svm_param_combinations = embedding_models
+            krusch_param_combinations = [
+                (e_model, n, alpha)
+                for e_model in embedding_models
+                for n in krusch_neighbors
+                for alpha in krusch_ridge_alphas
+            ]
             model_routers_and_names += generate_svm_routers(
                 svm_param_combinations,
                 cache,
@@ -439,6 +481,17 @@ if __name__ == "__main__":
                 knn_param_combinations,
                 cache,
                 dataset_df_train,
+                fraction,
+                MODELS_TO_ROUTE,
+            )
+            model_routers_and_names += generate_krusch_routers(
+                krusch_param_combinations,
+                cache,
+                dataset_df_train,
+                fraction,
+                MODELS_TO_ROUTE,
+            )
+            model_routers_and_names += generate_krusch_zero_shot_routers(
                 fraction,
                 MODELS_TO_ROUTE,
             )

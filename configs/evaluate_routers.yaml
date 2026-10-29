@@ -15,6 +15,9 @@ mlp:
   hidden_layer_sizes: [100, [100, 100]]
   activation: ["relu",]
   learning_rates: [0.001,]
+krusch_cascade:
+  neighbors: [32]
+  ridge_alphas: [14.0]
 cascading_router:
   max_cost_per_response_list: [
                     0.001,
